@@ -51,7 +51,7 @@ fn main() -> Result<()> {
 
 fn run_shell_command(base: &str, command: &str) -> Result<()> {
     let response = post_shell(base, json!({ "cmd": command }))?;
-    print!("{}", response.output);
+    print!("{}", strip_ansi(&response.output));
     io::stdout().flush()?;
 
     if response.rc != 0 {
@@ -63,7 +63,7 @@ fn run_shell_command(base: &str, command: &str) -> Result<()> {
 
 fn attach_shell(base: &str) -> Result<()> {
     let response = post_shell(base, json!({}))?;
-    print!("{}", response.output);
+    print!("{}", strip_ansi(&response.output));
     io::stdout().flush()?;
 
     let stdin = io::stdin();
@@ -80,7 +80,7 @@ fn attach_shell(base: &str) -> Result<()> {
         }
 
         let response = post_shell(base, json!({ "input": line }))?;
-        print!("{}", response.output);
+        print!("{}", strip_ansi(&response.output));
         io::stdout().flush()?;
     }
 
@@ -116,4 +116,28 @@ fn push_file(base: &str, local: PathBuf, remote: &str) -> Result<()> {
 
     print!("{body}");
     Ok(())
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+
+        if chars.next() != Some('[') {
+            continue;
+        }
+
+        for next in chars.by_ref() {
+            if next.is_ascii_alphabetic() {
+                break;
+            }
+        }
+    }
+
+    out
 }
