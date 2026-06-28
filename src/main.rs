@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -34,6 +34,9 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
+    Ota {
+        image: PathBuf,
+    },
 }
 
 #[derive(Deserialize)]
@@ -47,6 +50,14 @@ struct LogResponse {
     messages: String,
 }
 
+#[derive(Deserialize)]
+struct OtaResponse {
+    ok: Option<bool>,
+    bytes: Option<u64>,
+    reboot_ms: Option<u32>,
+    error: Option<i32>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let base = format!("http://{}:{}", cli.host, cli.port);
@@ -56,6 +67,7 @@ fn main() -> Result<()> {
         Command::Shell { command } => run_shell_command(&base, &command.join(" ")),
         Command::Push { local, remote } => push_file(&base, local, &remote),
         Command::Log { follow } => run_log(&base, follow),
+        Command::Ota { image } => run_ota(&base, &image),
     }
 }
 
@@ -130,7 +142,7 @@ fn push_file(base: &str, local: PathBuf, remote: &str) -> Result<()> {
 
 fn run_log(base: &str, follow: bool) -> Result<()> {
     loop {
-        let messages = fetch_logs(base)?;
+        let messages = fetch_logs(base, follow)?;
         if !messages.is_empty() {
             print!("{}", messages);
             io::stdout().flush()?;
@@ -143,11 +155,11 @@ fn run_log(base: &str, follow: bool) -> Result<()> {
     Ok(())
 }
 
-fn fetch_logs(base: &str) -> Result<String> {
+fn fetch_logs(base: &str, clear: bool) -> Result<String> {
     let url = format!("{base}/log");
     let response = ureq::post(&url)
         .set("Content-Type", "application/json")
-        .send_json(json!({}))
+        .send_json(json!({ "clear": clear }))
         .with_context(|| format!("POST {url}"))?;
 
     let body: LogResponse = response
@@ -155,6 +167,72 @@ fn fetch_logs(base: &str) -> Result<String> {
         .with_context(|| format!("decode response from {url}"))?;
 
     Ok(body.messages)
+}
+
+struct ProgressReader {
+    inner: fs::File,
+    total: u64,
+    read: u64,
+}
+
+impl Read for ProgressReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            let _ = io::stderr().write_all(b"\n");
+            return Ok(0);
+        }
+        self.read += n as u64;
+        let bar_width = 32;
+        let filled = (self.read as usize * bar_width / self.total as usize).min(bar_width);
+        let bar: String = (0..bar_width)
+            .map(|i| if i < filled { '=' } else { ' ' })
+            .collect();
+        let pct = self.read * 100 / self.total;
+        let _ = io::stderr().write_fmt(format_args!(
+            "\r[{bar}] {pct:>3}% {}/{}",
+            self.read, self.total
+        ));
+        let _ = io::stderr().flush();
+        Ok(n)
+    }
+}
+
+fn run_ota(base: &str, image: &PathBuf) -> Result<()> {
+    let file = fs::File::open(image)
+        .with_context(|| format!("open {}", image.display()))?;
+    let total = file.metadata()
+        .with_context(|| format!("stat {}", image.display()))?
+        .len();
+
+    let reader = ProgressReader { inner: file, total, read: 0 };
+    let url = format!("{base}/ota");
+    let response = ureq::post(&url)
+        .set("Content-Type", "application/octet-stream")
+        .set("Content-Length", &total.to_string())
+        .send(reader)
+        .with_context(|| format!("POST {url}"))?;
+
+    let status = response.status();
+    let body: OtaResponse = response
+        .into_json()
+        .with_context(|| format!("decode response from {url}"))?;
+
+    if !(200..300).contains(&status) {
+        bail!("OTA failed: HTTP {status}: error {}", body.error.unwrap_or(-1));
+    }
+
+    if body.ok == Some(true) {
+        println!(
+            "OTA complete: {} bytes written, rebooting in {} ms",
+            body.bytes.unwrap_or(0),
+            body.reboot_ms.unwrap_or(0)
+        );
+    } else {
+        bail!("OTA failed: error {}", body.error.unwrap_or(-1));
+    }
+
+    Ok(())
 }
 
 fn strip_ansi(input: &str) -> String {
