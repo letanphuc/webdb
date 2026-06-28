@@ -30,12 +30,21 @@ enum Command {
         local: PathBuf,
         remote: String,
     },
+    Log {
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
 
 #[derive(Deserialize)]
 struct ShellResponse {
     rc: i32,
     output: String,
+}
+
+#[derive(Deserialize)]
+struct LogResponse {
+    messages: String,
 }
 
 fn main() -> Result<()> {
@@ -46,6 +55,7 @@ fn main() -> Result<()> {
         Command::Shell { command } if command.is_empty() => attach_shell(&base),
         Command::Shell { command } => run_shell_command(&base, &command.join(" ")),
         Command::Push { local, remote } => push_file(&base, local, &remote),
+        Command::Log { follow } => run_log(&base, follow),
     }
 }
 
@@ -116,6 +126,35 @@ fn push_file(base: &str, local: PathBuf, remote: &str) -> Result<()> {
 
     print!("{body}");
     Ok(())
+}
+
+fn run_log(base: &str, follow: bool) -> Result<()> {
+    loop {
+        let messages = fetch_logs(base)?;
+        if !messages.is_empty() {
+            print!("{}", messages);
+            io::stdout().flush()?;
+        }
+        if !follow {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+fn fetch_logs(base: &str) -> Result<String> {
+    let url = format!("{base}/log");
+    let response = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(json!({}))
+        .with_context(|| format!("POST {url}"))?;
+
+    let body: LogResponse = response
+        .into_json()
+        .with_context(|| format!("decode response from {url}"))?;
+
+    Ok(body.messages)
 }
 
 fn strip_ansi(input: &str) -> String {
